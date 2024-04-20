@@ -3,14 +3,13 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
-#include <fstream>
 #include <mutex>
 
 int BLUR_WIDTH = 5;
-int BLUR_SIZE = 5;
+int BLUR_SIZE = 1000000000;
 
-std::mutex mutex;
 std::chrono::high_resolution_clock::time_point programStartTime;
+std::mutex mtx;
 
 class Data {
 public:
@@ -21,36 +20,39 @@ public:
     int threadIndex;
 };
 
+std::vector<std::pair<int, long long>> durations;
+
 void boxBlur(bitmap_image *image, bitmap_image *blurredImage, int startRow, int endRow, int blurSize, int threadIndex) {
     int width = image->width();
     int height = image->height();
 
+    std::vector<std::vector<int>> integralImageR(height, std::vector<int>(width));
+    std::vector<std::vector<int>> integralImageG(height, std::vector<int>(width));
+    std::vector<std::vector<int>> integralImageB(height, std::vector<int>(width));
+
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            rgb_t pixel;
+            image->get_pixel(j, i, pixel);
+
+            integralImageR[i][j] = pixel.red + (i > 0 ? integralImageR[i - 1][j] : 0) + (j > 0 ? integralImageR[i][j - 1] : 0) - (i > 0 && j > 0 ? integralImageR[i - 1][j - 1] : 0);
+            integralImageG[i][j] = pixel.green + (i > 0 ? integralImageG[i - 1][j] : 0) + (j > 0 ? integralImageG[i][j - 1] : 0) - (i > 0 && j > 0 ? integralImageG[i - 1][j - 1] : 0);
+            integralImageB[i][j] = pixel.blue + (i > 0 ? integralImageB[i - 1][j] : 0) + (j > 0 ? integralImageB[i][j - 1] : 0) - (i > 0 && j > 0 ? integralImageB[i - 1][j - 1] : 0);
+        }
+    }
+
     for (int i = startRow; i < endRow; i++) {
         for (int j = 0; j < width; ++j) {
-            auto start = std::chrono::high_resolution_clock::now();
+            int x1 = std::max(0, j - blurSize);
+            int y1 = std::max(0, i - blurSize);
+            int x2 = std::min(width - 1, j + blurSize);
+            int y2 = std::min(height - 1, i + blurSize);
 
-            int redSum = 0;
-            int greenSum = 0;
-            int blueSum = 0;
-            int count = 0;
+            int count = (x2 - x1 + 1) * (y2 - y1 + 1);
 
-            for (int di = -blurSize; di <= blurSize; ++di) {
-                for (int dj = -blurSize; dj <= blurSize; ++dj) {
-                    int ni = i + di;
-                    int nj = j + dj;
-
-                    if (ni >= 0 && ni < height && nj >= 0 && nj < width) {
-                        rgb_t pixel;
-                        image->get_pixel(nj, ni, pixel);
-
-                        redSum += pixel.red;
-                        greenSum += pixel.green;
-                        blueSum += pixel.blue;
-
-                        ++count;
-                    }
-                }
-            }
+            int redSum = integralImageR[y2][x2] - (x1 > 0 ? integralImageR[y2][x1 - 1] : 0) - (y1 > 0 ? integralImageR[y1 - 1][x2] : 0) + (x1 > 0 && y1 > 0 ? integralImageR[y1 - 1][x1 - 1] : 0);
+            int greenSum = integralImageG[y2][x2] - (x1 > 0 ? integralImageG[y2][x1 - 1] : 0) - (y1 > 0 ? integralImageG[y1 - 1][x2] : 0) + (x1 > 0 && y1 > 0 ? integralImageG[y1 - 1][x1 - 1] : 0);
+            int blueSum = integralImageB[y2][x2] - (x1 > 0 ? integralImageB[y2][x1 - 1] : 0) - (y1 > 0 ? integralImageB[y1 - 1][x2] : 0) + (x1 > 0 && y1 > 0 ? integralImageB[y1 - 1][x1 - 1] : 0);
 
             rgb_t blurredPixel;
             blurredPixel.red = redSum / count;
@@ -59,15 +61,11 @@ void boxBlur(bitmap_image *image, bitmap_image *blurredImage, int startRow, int 
 
             blurredImage->set_pixel(j, i, blurredPixel);
 
-            auto end = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - programStartTime).count();
-
-            std::lock_guard<std::mutex> lock(mutex);
-            std::ofstream outfile("durations.txt", std::ios_base::app);
-            if (outfile.is_open()) {
-                outfile << "Thread " << threadIndex << " | " << duration << " ms" << std::endl;
-                outfile.close();
-            }
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - programStartTime).count();
+            mtx.lock();
+            durations.emplace_back(threadIndex, duration);
+            mtx.unlock();
         }
     }
 }
@@ -78,10 +76,9 @@ DWORD WINAPI ThreadProc(LPVOID lpParam) {
     ExitThread(0);
 }
 
-
 int main(int argc, char *argv[]) {
     if (argc != 5) {
-        std::cout << "Args: *.exe input.bmp output.bmp threads cores" << std::endl;
+        std::cout << "Args: *.exe input.bmp output.bmp cores threads" << std::endl;
         return 1;
     }
 
@@ -128,16 +125,16 @@ int main(int argc, char *argv[]) {
 
             if (handles[j] == nullptr) continue;
 
-            int priority;
-            if (j == 0) {
-                priority = THREAD_PRIORITY_ABOVE_NORMAL;
-            } else {
-                priority = THREAD_PRIORITY_NORMAL;
-            }
-            SetThreadPriority(handles[j], priority);
+//            int priority;
+//            if (j == 0) {
+//                priority = THREAD_PRIORITY_ABOVE_NORMAL;
+//            } else {
+//                priority = THREAD_PRIORITY_LOWEST;
+//            }
+//            SetThreadPriority(handles[j], priority);
 
-            DWORD_PTR affinity_mask = (DWORD_PTR)1 << (i % coresCount);
-            SetThreadAffinityMask(handles[i], affinity_mask);
+//            DWORD_PTR affinity_mask = (DWORD_PTR)1 << (i % coresCount);
+//            SetThreadAffinityMask(handles[i], affinity_mask);
         }
 
         for (int k = 0; k < threadsCount; k++) {
@@ -153,9 +150,16 @@ int main(int argc, char *argv[]) {
 
     newImage.save_image(outputFile);
 
+    std::ofstream outfile("durations.txt", std::ios_base::out);
+    std::lock_guard<std::mutex> lock(mtx);
+    for (const auto &pair : durations) {
+        outfile << "Thread " << pair.first + 1 << " | " << pair.second << " ms" << std::endl;
+    }
+
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - programStartTime).count();
 
     std::cout << "Time: " << duration << " ms" << std::endl;
+
     return 0;
 }
